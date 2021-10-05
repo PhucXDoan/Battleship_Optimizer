@@ -1,188 +1,270 @@
--- @TODO@
--- @performance@ outputting to console is SLOW
--- @hygine@ Tile system is kinda weird and also Grid
--- @improve@ a better algorithm to calculate the next best move
--- @improve@ more safety checks
--- @sticky@ have a function "propagate" that counts how many damaged tiles there are in a chain and the positions; must be fast as possible
-{-# LANGUAGE MultiWayIf #-}
-import Control.Monad
-import Data.List
-import Data.Either
-import Data.Function
+import Data.Maybe
 import Data.Functor
+import Data.Function
 import Data.Char
+import Data.List
 import System.IO
 import Text.Read
-import Auxiliary
 
-data Result   = Empty | Damaged | Sunken deriving (Show, Eq, Read)
-type Tile     = Either Int Result
-type Grid     = [[Tile]]
-type Ship     = Int
-type Registry = [(Int, Ship)]
+---
+
+data Result = Empty | Damaged | Sunken
+    deriving (Eq, Show, Read)
+
+data Tile = Count Int | Likely Int | Known Result
+    deriving Eq
+
+data Grid = Grid Int [Tile]
+
 type Position = (Int, Int)
+type Registry = [(Int, Int)]
 
-render :: Registry -> Grid -> String
-render registry grid =
-    intercalate "\n" $
-        [
-            margin,
-            margin ++ (concat $ map (\c -> "   " ++ [c] ++ "  ") $ take dimension ['A' .. 'Z']),
-            margin,
-            divider
-        ] ++ [
-            intercalate "\n"
-                $ map concat
-                $ transpose
-                $ ["    |", " " ++ padStart 2 ' ' (show $ y + 1) ++ " |", "    |"] : [renderLinesOfTile $ tileAt grid (x, y) | x <- indices]
-            | y <- indices
-        ] ++ [
-            divider,
-            margin ++ " " ++ (intercalate " | " $ map (\(shipCount, shipLength) -> show shipLength ++ "-ship(s): " ++ show shipCount) registry),
-            divider
-        ]
-    where dimension = length grid
-          indices   = [0 .. dimension - 1]
-          divider   = replicate (5 + 6 * dimension) '-'
-          margin    = "    |"
-          renderLinesOfTile (Left  n)       = ["      ", "  " ++ padStart 2 '0' (show n) ++ "  ", "      "]
-          renderLinesOfTile (Right Empty)   = ["      ", "      ", "      "]
-          renderLinesOfTile (Right Damaged) = ["  **  ", "******", "  **  "]
-          renderLinesOfTile (Right Sunken)  = ["XXXXXX", "XXXXXX", "XXXXXX"]
-
-tileAt :: Grid -> Position -> Tile
-tileAt grid (x, y) = grid !! y !! x
+---
 
 tileAtMaybe :: Grid -> Position -> Maybe Tile
-tileAtMaybe grid (x, y) = grid `atMaybe` y >>= (`atMaybe` x)
+tileAtMaybe (Grid dimension tiles) (x, y) =
+    if 0 <= x && x < dimension && 0 <= y && y < dimension
+    then Just $ tiles !! (x + y * dimension)
+    else Nothing
+
+-- tileAt :: Grid -> Position -> Tile
+-- tileAt grid position =
+--     fromJust $ grid `tileAtMaybe` position
 
 tilesAt :: Grid -> [Position] -> [Tile]
-tilesAt _ [] = []
-tilesAt grid (p:ps) =
-    maybe rest (: rest) (grid `tileAtMaybe` p)
-    where rest = grid `tilesAt` ps
+tilesAt grid = catMaybes . map (tileAtMaybe grid)
 
 trySetTile :: Tile -> Position -> Grid -> Grid
-trySetTile tile (x, y) grid =
-    grid `atMaybe` y <&> trySet tile x & maybe grid (\row -> trySet row y grid)
+trySetTile tile (x, y) (Grid dimension tiles) =
+    if 0 <= x && x < dimension && 0 <= y && y < dimension
+    then Grid dimension $ take (x + y * dimension) tiles ++ [tile] ++ drop (x + y * dimension + 1) tiles
+    else Grid dimension tiles
 
 trySetTiles :: Tile -> [Position] -> Grid -> Grid
-trySetTiles _    []     grid = grid
-trySetTiles tile (p:ps) grid = trySetTiles tile ps $ trySetTile tile p grid
+trySetTiles _    []     = id
+trySetTiles tile (p:ps) = trySetTiles tile ps . trySetTile tile p
 
-getAdjacentPositions :: Position -> [Position]
-getAdjacentPositions (x, y) =
-    [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
+calcAdjacents :: Position -> [Position]
+calcAdjacents (x, y) = [(x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)]
 
-getCornerPositions :: Position -> [Position]
-getCornerPositions (x, y) =
-    [(x + dx, y + dy) | dx <- [-1, 1], dy <- [-1, 1]]
+calcCorners :: Position -> [Position]
+calcCorners (x, y) = [(x - 1, y - 1), (x + 1, y - 1), (x - 1, y + 1), (x + 1, y + 1)]
 
-getNeighborsOfPositions :: [Position] -> [Position]
-getNeighborsOfPositions ps =
-    ps
-        >>= (\p -> getAdjacentPositions p ++ getCornerPositions p)
-        & filter (not . (`elem` ps))
-        & nub
+calcNeighbors :: Position -> [Position]
+calcNeighbors p = calcAdjacents p ++ calcCorners p
 
-getAttackData :: Grid -> IO (Position, Result)
-getAttackData grid =
-    do putStr "Coordinates and Result: "
+ensure :: (a -> Bool) -> a -> Maybe a
+ensure p x =
+    if p x
+    then Just x
+    else Nothing
+
+getReadTested :: Read a => String -> (a -> Bool) -> IO a
+getReadTested message predicate =
+    do putStr message
+       hFlush stdout
+       getLine
+           <&> readMaybe
+           <&> (>>= ensure predicate)
+           >>= maybe (getReadTested message predicate) pure
+
+getResult :: IO Result
+getResult =
+    do putStr "Result: "
        hFlush stdout
        getLine
            <&> words
-           <&> ensure ((== 2) . length)
-           <&> (<&> \[file:strRank, c:cs] -> (toLower file, strRank, toUpper c : map toLower cs))
-           <&> (>>= \(file, strRank, strResult) ->
-                        do let x = ord file - ord 'a'
-                           y <- readMaybe strRank <&> subtract 1
-                           result <- readMaybe strResult
-                           guard $ any isLeft $ tileAtMaybe grid (x, y)
-                           pure $ ((x, y), result)
-               )
-           >>= maybe (getAttackData grid) pure
+           <&> ensure ((== 1) . length)
+           <&> (<&> (\[c:cs] -> toUpper c : map toLower cs))
+           <&> (>>= readMaybe)
+           >>= maybe getResult pure
 
-updateSinkShip :: Registry -> Position -> Grid -> (Registry, Grid)
-updateSinkShip registry sunkenPosition grid =
-    (
-        tryFindMap ((== length damagedPositions + 1) . snd) (mapFst (subtract 1)) registry,
-        trySetTiles (Right Empty) neighborPositions $ trySetTiles (Right Sunken) damagedPositions grid
-    )
-    where damagedPositions =
-              applySuccessivelyUntil
-                  nonDisjoint
-                  (\positions ->
-                      positions
-                          >>= getAdjacentPositions
-                          & (++ positions)
-                          & filter ((== Just (Right Damaged)) . tileAtMaybe grid)
-                          & nub
-                  )
-                  [sunkenPosition]
-          neighborPositions = getNeighborsOfPositions (sunkenPosition:damagedPositions)
+padStart :: Int -> a -> [a] -> [a]
+padStart n x xs = replicate (n - length xs) x ++ xs
 
-markCornersEmpty :: Position -> Grid -> Grid
-markCornersEmpty = trySetTiles (Right Empty) . getCornerPositions
+inChunks :: Int -> [a] -> [[a]]
+inChunks _ [] = []
+inChunks n xs = take n xs : inChunks n (drop n xs)
 
-canShipFitHorizontally :: Position -> Grid -> Ship -> Bool
-canShipFitHorizontally (x, y) grid shipLength =
-    length shipTiles == shipLength &&
-    all (\tile -> isLeft tile || tile == Right Damaged) shipTiles &&
-    all (/= Right Damaged) neighborTiles
-    where shipPositions = [(x', y) | x' <- [x .. x + shipLength - 1]]
-          shipTiles = tilesAt grid shipPositions
-          neighborTiles = tilesAt grid $ getNeighborsOfPositions shipPositions
+isTileKnown :: Tile -> Bool
+isTileKnown (Known _) = True
+isTileKnown _         = False
 
-canShipFitVertically :: Position -> Grid -> Ship -> Bool
-canShipFitVertically (x, y) grid =
-    canShipFitHorizontally (y, x) (transpose grid)
+isTileLikely :: Tile -> Bool
+isTileLikely (Likely _) = True
+isTileLikely _          = False
 
-calculateShipCountsInGrid :: Registry -> Grid -> Grid
-calculateShipCountsInGrid registry grid =
-    [[if isLeft tile then determine (x, y) else tile | x <- indices, let tile = tileAt grid (x, y)] | y <- indices]
-    where indices = [0 .. length grid - 1]
-          determine p = Left $ sum $ map (count p . snd) $ filter ((0 <) . fst) registry
-          count (x, y) shipLength =
-              (length $ filter (\p -> canShipFitHorizontally p grid shipLength) [(x', y) | x' <- [x - shipLength + 1 .. x]]) +
-              (if shipLength /= 1
-               then length $ filter (\p -> canShipFitVertically p grid shipLength) [(x, y') | y' <- [y - shipLength + 1 .. y]]
-               else 0
-              )
+extractTile :: Tile -> Int
+extractTile (Count  n) = n
+extractTile (Likely n) = n
+extractTile _          = undefined
 
-getBestMove :: Grid -> String
-getBestMove grid =
-    [(x, y) | x <- indices, y <- indices]
-        & filter (isLeft . tileAt grid)
-        & map (\p -> (p, extractLeft $ tileAt grid p))
+mapFst :: (a -> c) -> (a, b) -> (c, b)
+mapFst f (x, y) = (f x, y)
+
+mapSnd :: (b -> c) -> (a, b) -> (a, c)
+mapSnd f (x, y) = (x, f y)
+
+zipGrid :: Grid -> [(Position, Tile)]
+zipGrid (Grid dimension tiles) =
+    [((x, y), tiles !! (x + y * dimension)) | y <- indices, x <- indices]
+    where indices = [0 .. dimension - 1]
+
+imapGrid :: (Position -> Tile -> Tile) -> Grid -> Grid
+imapGrid f (Grid dimension tiles) =
+    Grid dimension [f (x, y) (tiles !! (x + y * dimension)) | y <- indices, x <- indices]
+    where indices = [0 .. dimension - 1]
+
+-- applyWhen :: Bool -> (a -> a) -> a -> a
+-- applyWhen True  f = f
+-- applyWhen False _ = id
+
+-- swap :: (a, b) -> (b, a)
+-- swap (x, y) = (y, x)
+
+transposeGrid :: Grid -> Grid
+transposeGrid (Grid dimension tiles) =
+    Grid dimension $ concat $ transpose $ inChunks dimension tiles
+
+tryFindMap :: (a -> Bool) -> (a -> a) -> [a] -> [a]
+tryFindMap _ _ []     = []
+tryFindMap p f (x:xs) =
+    if p x
+    then f x : xs
+    else   x : tryFindMap p f xs
+
+---
+
+render :: Registry -> Grid -> IO ()
+render registry (Grid dimension tiles) =
+    do putStrLn divider
+       putStrLn emptyFiles
+       putStrLn $ "|      |" ++ concat [" <" ++ [file, file] ++ "> |" | file <- take dimension ['A'..'Z']]
+       putStrLn emptyFiles
+       putStrLn divider
+       putStrLn
+           $ intercalate "\n"
+           $ intersperse divider
+           $ map (intercalate "\n" . map (concat . map (++ "|")) . transpose)
+           $ map (\(rank, row) -> ["|      ", "| <" ++ seralizeInt rank ++ "> ", "|      "] : row)
+           $ zip [1..]
+           $ inChunks dimension
+           $ map calcRenderLines tiles
+       putStrLn divider
+       putStrLn $ intercalate " | " $ map (\(count, shipLength) -> show shipLength ++ "-length ship(s): " ++ show count) registry
+       putStrLn divider
+    where divider     = replicate (7 * dimension + 8) '-'
+          emptyFiles  = "|      |" ++ concat (replicate dimension ("      |"))
+          seralizeInt = padStart 2 '0' . show
+          calcRenderLines (Count n)       = ["======", "==" ++ seralizeInt n ++ "==", "======"]
+          calcRenderLines (Likely n)      = ["  !!  ", "!!" ++ seralizeInt n ++ "!!", "  !!  "]
+          calcRenderLines (Known Empty)   = replicate 3 $ replicate 6 ' '
+          calcRenderLines (Known Damaged) = ["  **  ", "******", "  **  "]
+          calcRenderLines (Known Sunken)  = replicate 3 $ replicate 6 'X'
+
+calcBestMove :: Grid -> Maybe Position
+calcBestMove grid =
+    grid
+        & zipGrid
+        & filter (not . isTileKnown . snd)
+        & (\xs -> let xs' = filter (isTileLikely . snd) xs in if xs' == [] then xs else xs')
+        & map (mapSnd extractTile)
         & ensure (/= [])
-        <&> foldl1 (\bestPair pair -> if snd bestPair < snd pair then pair else bestPair)
-        & maybe "N/A" (\((x, y), n) -> chr (ord 'a' + x) : show (y + 1) ++ " with a ship count of: " ++ show n)
-    where indices = [0 .. length grid - 1]
+        <&> foldl1 (\p q -> if snd p < snd q then q else p)
+        <&> fst
 
-possibleShips :: [Ship]
-possibleShips = [1..4]
+sinkHorizontalShip :: Position -> Registry -> Grid -> (Registry, Grid)
+sinkHorizontalShip (x, y) registry grid =
+    (
+        tryFindMap ((== length shipPositions) . snd) (mapFst (subtract 1)) registry,
+        trySetTiles (Known Empty) neighborPositions $ trySetTiles (Known Sunken) shipPositions grid
+    )
+    where shipPositions =
+              [1..]
+                  <&> (\dx -> [(x - dx, y), (x + dx, y)])
+                  <&> filter ((== Just (Known Damaged)) . tileAtMaybe grid)
+                  & takeWhile (/= [])
+                  & concat
+                  & ((x, y) :)
+                  & sortBy (\(x0, _) (x1, _) -> compare x0 x1)
+          neighborPositions =
+              shipPositions
+                  >>= (\(px, py) -> [(px, py - 1), (px, py + 1)])
+                  & ([(px + dx, py + dy) | (dx, (px, py)) <- [(-1, head shipPositions), (1, last shipPositions)], dy <- [-1, 0, 1]] ++)
+
+sinkShip :: Position -> Registry -> Grid -> (Registry, Grid)
+sinkShip (x, y) registry grid =
+    if any ((== Just (Known Damaged)) . tileAtMaybe grid) [(x - 1, y), (x + 1, y)]
+    then sinkHorizontalShip (x, y) registry grid
+    else mapSnd transposeGrid $ sinkHorizontalShip (y, x) registry (transposeGrid grid)
+
+canHorizontalShipFit :: Grid -> Int -> Position -> Bool
+canHorizontalShipFit grid shipLength (x, y) =
+    length shipTiles == shipLength &&
+    all (\tile -> (not . isTileKnown) tile || tile == Known Damaged) shipTiles &&
+    all (/= Known Damaged) neighborTiles
+    where shipPositions = [(x + dx, y) | dx <- [0 .. shipLength - 1]]
+          shipTiles = grid `tilesAt` shipPositions
+          neighborTiles =
+              shipPositions
+                  >>= (\(px, py) -> [(px, py - 1), (px, py + 1)])
+                  & ([(px + dx, py + dy) | (dx, (px, py)) <- [(-1, head shipPositions), (1, last shipPositions)], dy <- [-1, 0, 1]] ++)
+                  & tilesAt grid
+
+canVerticalShipFit :: Grid -> Int -> Position -> Bool
+canVerticalShipFit grid shipLength (x, y) =
+    canHorizontalShipFit (transposeGrid grid) shipLength (y, x)
+
+calcShipCount :: Registry -> Position -> Grid -> Int
+calcShipCount registry (x, y) grid =
+    do shipLength <- map snd $ filter ((1 <=) . fst) registry
+       if shipLength == 1
+       then do if any (== Known Damaged) $ grid `tilesAt` (calcNeighbors (x, y))
+               then do pure 0
+               else do pure 1
+       else do let hCount = length $ filter (canHorizontalShipFit grid shipLength) [(x + dx, y) | dx <- [-shipLength + 1 .. 0]]
+               let vCount = length $ filter (canVerticalShipFit grid shipLength) [(x, y + dy) | dy <- [-shipLength + 1 .. 0]]
+               pure $ hCount + vCount
+    & sum
+
+updateUnknownTiles :: Registry -> Grid -> Grid
+updateUnknownTiles registry grid =
+    imapGrid
+        (\position tile ->
+            if isTileKnown tile
+            then tile
+            else let shipCount = calcShipCount registry position grid
+                 in if shipCount == 0
+                    then Known Empty
+                    else if any (== Known Damaged) $ grid `tilesAt` (calcAdjacents position)
+                    then Likely shipCount
+                    else Count shipCount
+        ) grid
 
 program :: Registry -> Grid -> IO ()
 program registry grid =
-    do putStrLn $ render registry grid
-       putStrLn $ getBestMove grid
-
-       (position, result) <- getAttackData grid
-
-       let settedGrid = trySetTile (Right result) position grid
-       let (registry', grid') = case result of
-                                    Sunken  -> updateSinkShip registry position settedGrid
-                                    Damaged -> (registry, markCornersEmpty position settedGrid)
-                                    _       -> (registry, settedGrid)
-       program registry' (calculateShipCountsInGrid registry' grid')
+    do render registry grid
+       case calcBestMove grid of
+           Nothing ->
+               do putStrLn "No more possible moves"
+           Just bestMove ->
+               do putStrLn $ "Best move is at: " ++ [chr (ord 'A' + fst bestMove)] ++ show (snd bestMove + 1)
+                  result <- getResult
+                  let settedGrid = trySetTile (Known result) bestMove grid
+                  let (registry', reactedGrid) = case result of
+                                                     Empty   -> (registry, settedGrid)
+                                                     Damaged -> (registry, trySetTiles (Known Empty) (calcCorners bestMove) settedGrid)
+                                                     Sunken  -> sinkShip bestMove registry settedGrid
+                  program registry' $ updateUnknownTiles registry' reactedGrid
 
 main :: IO ()
 main =
-    do registry <-
-           possibleShips
-               & map (\shipLength -> getReadTested ("Amount of " ++ show shipLength ++ "-long ships: ") (0 <=))
+    do dimension <- getReadTested "Dimensions of grid: " (\n -> 1 <= n && n <= 26)
+       registry <-
+           shipLengths
+               & map (\shipLength -> getReadTested ("Amount of " ++ show shipLength ++ "-long ship(s): ") (\n -> 0 <= n && n <= 9))
                & sequence
-               <&> flip zip possibleShips
-       dimension <- getReadTested "Dimensions of grid: " (\n -> 0 < n && n <= 26)
-       program registry $ calculateShipCountsInGrid registry $ replicate dimension $ replicate dimension $ Left 0
+               <&> (`zip` shipLengths)
+       program registry $ updateUnknownTiles registry $ Grid dimension $ replicate (dimension ^ (2 :: Int)) (Count 0)
+    where shipLengths = [1, 2, 3, 4]
 
