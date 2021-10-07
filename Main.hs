@@ -1,3 +1,4 @@
+{-# LANGUAGE MultiWayIf #-}
 import Data.Maybe
 import Data.Functor
 import Data.Function
@@ -11,7 +12,7 @@ import Text.Read
 data Result = Empty | Damaged | Sunken
     deriving (Eq, Show, Read)
 
-data Tile = Count Int | Likely Int | Known Result
+data Tile = Count Int | Known Result
     deriving Eq
 
 data Grid = Grid Int [Tile]
@@ -26,10 +27,6 @@ tileAtMaybe (Grid dimension tiles) (x, y) =
     if 0 <= x && x < dimension && 0 <= y && y < dimension
     then Just $ tiles !! (x + y * dimension)
     else Nothing
-
--- tileAt :: Grid -> Position -> Tile
--- tileAt grid position =
---     fromJust $ grid `tileAtMaybe` position
 
 tilesAt :: Grid -> [Position] -> [Tile]
 tilesAt grid = catMaybes . map (tileAtMaybe grid)
@@ -90,13 +87,8 @@ isTileKnown :: Tile -> Bool
 isTileKnown (Known _) = True
 isTileKnown _         = False
 
-isTileLikely :: Tile -> Bool
-isTileLikely (Likely _) = True
-isTileLikely _          = False
-
 extractTile :: Tile -> Int
 extractTile (Count  n) = n
-extractTile (Likely n) = n
 extractTile _          = undefined
 
 mapFst :: (a -> c) -> (a, b) -> (c, b)
@@ -114,13 +106,6 @@ imapGrid :: (Position -> Tile -> Tile) -> Grid -> Grid
 imapGrid f (Grid dimension tiles) =
     Grid dimension [f (x, y) (tiles !! (x + y * dimension)) | y <- indices, x <- indices]
     where indices = [0 .. dimension - 1]
-
--- applyWhen :: Bool -> (a -> a) -> a -> a
--- applyWhen True  f = f
--- applyWhen False _ = id
-
--- swap :: (a, b) -> (b, a)
--- swap (x, y) = (y, x)
 
 transposeGrid :: Grid -> Grid
 transposeGrid (Grid dimension tiles) =
@@ -157,21 +142,33 @@ render registry (Grid dimension tiles) =
           emptyFiles  = "|      |" ++ concat (replicate dimension ("      |"))
           seralizeInt = padStart 2 '0' . show
           calcRenderLines (Count n)       = ["======", "==" ++ seralizeInt n ++ "==", "======"]
-          calcRenderLines (Likely n)      = ["  !!  ", "!!" ++ seralizeInt n ++ "!!", "  !!  "]
           calcRenderLines (Known Empty)   = replicate 3 $ replicate 6 ' '
           calcRenderLines (Known Damaged) = ["  **  ", "******", "  **  "]
           calcRenderLines (Known Sunken)  = replicate 3 $ replicate 6 'X'
 
+-- @speed@ make Count tiles have info that says that they are high-priority
 calcBestMove :: Grid -> Maybe Position
 calcBestMove grid =
-    grid
-        & zipGrid
-        & filter (not . isTileKnown . snd)
-        & (\xs -> let xs' = filter (isTileLikely . snd) xs in if xs' == [] then xs else xs')
-        & map (mapSnd extractTile)
+    usingList
         & ensure (/= [])
         <&> foldl1 (\p q -> if snd p < snd q then q else p)
         <&> fst
+    where zippedGrid = zipGrid grid
+          adjacentToDamagedPositions =
+              zippedGrid
+                  & filter ((== Known Damaged) . snd)
+                  >>= calcAdjacents . fst
+                  <&> (\position ->
+                           grid `tileAtMaybe` position
+                               >>= ensure (not . isTileKnown)
+                               <&> extractTile
+                               <&> (\n -> (position, n))
+                      )
+                  & catMaybes
+          usingList =
+              if adjacentToDamagedPositions == []
+              then map (mapSnd extractTile) $ filter (not . isTileKnown . snd) zippedGrid
+              else adjacentToDamagedPositions
 
 sinkHorizontalShip :: Position -> Registry -> Grid -> (Registry, Grid)
 sinkHorizontalShip (x, y) registry grid =
@@ -211,34 +208,32 @@ canHorizontalShipFit grid shipLength (x, y) =
                   & ([(px + dx, py + dy) | (dx, (px, py)) <- [(-1, head shipPositions), (1, last shipPositions)], dy <- [-1, 0, 1]] ++)
                   & tilesAt grid
 
-canVerticalShipFit :: Grid -> Int -> Position -> Bool
-canVerticalShipFit grid shipLength (x, y) =
-    canHorizontalShipFit (transposeGrid grid) shipLength (y, x)
-
 calcShipCount :: Registry -> Position -> Grid -> Int
-calcShipCount registry (x, y) grid =
-    do shipLength <- map snd $ filter ((1 <=) . fst) registry
-       if shipLength == 1
-       then do if any (== Known Damaged) $ grid `tilesAt` (calcNeighbors (x, y))
-               then do pure 0
-               else do pure 1
-       else do let hCount = length $ filter (canHorizontalShipFit grid shipLength) [(x + dx, y) | dx <- [-shipLength + 1 .. 0]]
-               let vCount = length $ filter (canVerticalShipFit grid shipLength) [(x, y + dy) | dy <- [-shipLength + 1 .. 0]]
-               pure $ hCount + vCount
-    & sum
+calcShipCount registry position grid =
+    registry
+        & filter ((1 <=) . fst)
+        <&> snd
+        <&> calcShipCountOfLength
+        & sum
+    where calcShipCountOfLength 1          = fromEnum $ all (/= Known Damaged) $ tilesAt grid $ calcNeighbors position
+          calcShipCountOfLength shipLength =
+              [-shipLength + 1 .. 0]
+                  <&> (\delta -> ((fst position + delta, snd position), (snd position + delta, fst position)))
+                  >>= (\(p, q) -> [canHorizontalShipFit grid shipLength p, canHorizontalShipFit (transposeGrid grid) shipLength q])
+                  & filter id
+                  & length
 
 updateUnknownTiles :: Registry -> Grid -> Grid
 updateUnknownTiles registry grid =
     imapGrid
         (\position tile ->
-            if isTileKnown tile
-            then tile
-            else let shipCount = calcShipCount registry position grid
-                 in if shipCount == 0
-                    then Known Empty
-                    else if any (== Known Damaged) $ grid `tilesAt` (calcAdjacents position)
-                    then Likely shipCount
-                    else Count shipCount
+            let shipCount = calcShipCount registry position grid
+            in if | isTileKnown tile
+                      -> tile
+                  | shipCount == 0
+                      -> Known Empty
+                  | otherwise
+                      -> Count shipCount
         ) grid
 
 program :: Registry -> Grid -> IO ()
