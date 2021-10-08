@@ -83,13 +83,13 @@ inChunks :: Int -> [a] -> [[a]]
 inChunks _ [] = []
 inChunks n xs = take n xs : inChunks n (drop n xs)
 
-isTileKnown :: Tile -> Bool
-isTileKnown (Known _) = True
-isTileKnown _         = False
+isKnown :: Tile -> Bool
+isKnown (Known _) = True
+isKnown _         = False
 
 extractTile :: Tile -> Int
-extractTile (Count  n) = n
-extractTile _          = undefined
+extractTile (Count n) = n
+extractTile _         = undefined
 
 mapFst :: (a -> c) -> (a, b) -> (c, b)
 mapFst f (x, y) = (f x, y)
@@ -160,21 +160,23 @@ calcBestMove grid =
                   >>= calcAdjacents . fst
                   <&> (\position ->
                            grid `tileAtMaybe` position
-                               >>= ensure (not . isTileKnown)
+                               >>= ensure (not . isKnown)
                                <&> extractTile
                                <&> (\n -> (position, n))
                       )
                   & catMaybes
           usingList =
               if adjacentToDamagedPositions == []
-              then map (mapSnd extractTile) $ filter (not . isTileKnown . snd) zippedGrid
+              then map (mapSnd extractTile) $ filter (not . isKnown . snd) zippedGrid
               else adjacentToDamagedPositions
 
-sinkHorizontalShip :: Position -> Registry -> Grid -> (Registry, Grid)
-sinkHorizontalShip (x, y) registry grid =
+sinkShipH :: Position -> Registry -> Grid -> (Registry, Grid)
+sinkShipH (x, y) registry grid =
     (
         tryFindMap ((== length shipPositions) . snd) (mapFst (subtract 1)) registry,
-        trySetTiles (Known Empty) neighborPositions $ trySetTiles (Known Sunken) shipPositions grid
+        grid
+            & trySetTiles (Known Sunken) shipPositions
+            & trySetTiles (Known Empty)  neighborPositions
     )
     where shipPositions =
               [1..]
@@ -183,7 +185,7 @@ sinkHorizontalShip (x, y) registry grid =
                   & takeWhile (/= [])
                   & concat
                   & ((x, y) :)
-                  & sortBy (\(x0, _) (x1, _) -> compare x0 x1)
+                  & sortBy (\(px, _) (qx, _) -> compare px qx)
           neighborPositions =
               shipPositions
                   >>= (\(px, py) -> [(px, py - 1), (px, py + 1)])
@@ -191,35 +193,42 @@ sinkHorizontalShip (x, y) registry grid =
 
 sinkShip :: Position -> Registry -> Grid -> (Registry, Grid)
 sinkShip (x, y) registry grid =
-    if any ((== Just (Known Damaged)) . tileAtMaybe grid) [(x - 1, y), (x + 1, y)]
-    then sinkHorizontalShip (x, y) registry grid
-    else mapSnd transposeGrid $ sinkHorizontalShip (y, x) registry (transposeGrid grid)
+    if any (== Known Damaged) $ tilesAt grid [(x - 1, y), (x + 1, y)]
+    then sinkShipH (x, y) registry grid
+    else mapSnd transposeGrid $ sinkShipH (y, x) registry (transposeGrid grid)
 
-canHorizontalShipFit :: Grid -> Int -> Position -> Bool
-canHorizontalShipFit grid shipLength (x, y) =
-    length shipTiles == shipLength &&
-    all (\tile -> (not . isTileKnown) tile || tile == Known Damaged) shipTiles &&
-    all (/= Known Damaged) neighborTiles
+canShipFitH :: Grid -> Int -> Position -> Bool
+canShipFitH grid shipLength (x, y) =
+    (shipPositions
+         & tilesAt grid
+         & ensure ((== shipLength) . length)
+         & any (all (\tile -> (not . isKnown) tile || tile == Known Damaged))
+    ) &&
+    (shipPositions
+         >>= (\(px, py) -> [(px, py - 1), (px, py + 1)])
+         & (++ [(px, y + dy) | px <- [x - 1, x + shipLength], dy <- [-1, 0, 1]])
+         & tilesAt grid
+         & all (/= Known Damaged)
+    )
     where shipPositions = [(x + dx, y) | dx <- [0 .. shipLength - 1]]
-          shipTiles = grid `tilesAt` shipPositions
-          neighborTiles =
-              shipPositions
-                  >>= (\(px, py) -> [(px, py - 1), (px, py + 1)])
-                  & ([(px + dx, py + dy) | (dx, (px, py)) <- [(-1, head shipPositions), (1, last shipPositions)], dy <- [-1, 0, 1]] ++)
-                  & tilesAt grid
 
 calcShipCount :: Registry -> Position -> Grid -> Int
-calcShipCount registry position grid =
+calcShipCount registry position@(x, y) grid =
     registry
         & filter ((1 <=) . fst)
         <&> snd
         <&> calcShipCountOfLength
         & sum
-    where calcShipCountOfLength 1          = fromEnum $ all (/= Known Damaged) $ tilesAt grid $ calcNeighbors position
+    where calcShipCountOfLength 1 =
+              position
+                  & calcNeighbors
+                  & tilesAt grid
+                  & all (/= Known Damaged)
+                  & fromEnum
           calcShipCountOfLength shipLength =
               [-shipLength + 1 .. 0]
-                  <&> (\delta -> ((fst position + delta, snd position), (snd position + delta, fst position)))
-                  >>= (\(p, q) -> [canHorizontalShipFit grid shipLength p, canHorizontalShipFit (transposeGrid grid) shipLength q])
+                  <&> (\delta -> ((x + delta, y), (y + delta, x)))
+                  >>= (\(p, q) -> [canShipFitH grid shipLength p, canShipFitH (transposeGrid grid) shipLength q])
                   & filter id
                   & length
 
@@ -228,7 +237,7 @@ updateUnknownTiles registry grid =
     imapGrid
         (\position tile ->
             let shipCount = calcShipCount registry position grid
-            in if | isTileKnown tile
+            in if | isKnown tile
                       -> tile
                   | shipCount == 0
                       -> Known Empty
